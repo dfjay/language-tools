@@ -2,14 +2,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { svelte2tsx, internalHelpers, InternalHelpers } from 'svelte2tsx';
-import { parse, VERSION as svelteVersion, VERSION } from 'svelte/compiler';
 import ts from 'typescript';
 import { Diagnostic, DiagnosticSeverity, Range } from 'vscode-languageserver-protocol';
 import {
     mapSvelteCheckDiagnostics,
     offsetAt,
     positionAt,
-    getLineOffsets
+    getLineOffsets,
+    getPackageInfo,
+    importSvelte
 } from 'svelte-language-server';
 import { loadConfig } from '@sveltejs/load-config';
 import { findFiles } from './utils';
@@ -60,6 +61,7 @@ const MANIFEST_VERSION = 3;
 const SVELTE_KIT_DIR = '.svelte-kit';
 const CACHE_DIR_NAME = '.svelte-check';
 const EMIT_SUBDIR = 'svelte';
+const SHIMS_SUBDIR = 'shims';
 
 /**
  * Determines the cache directory location for svelte-check output.
@@ -164,6 +166,7 @@ export async function emitSvelteFiles(
         ? loadManifest(manifestPath, workspacePath)
         : { version: MANIFEST_VERSION, entries: {} as Record<string, ManifestEntry> };
     const kitFilesSettings = await loadKitFilesSettings(workspacePath, config);
+    const svelte = importSvelte(workspacePath);
     const isJsOrTsFile = (filePath: string) => filePath.endsWith('.ts') || filePath.endsWith('.js');
     const allRelevantFiles = await findFiles(
         workspacePath,
@@ -239,8 +242,8 @@ export async function emitSvelteFiles(
 
         try {
             const tsx = svelte2tsx(text, {
-                parse,
-                version: svelteVersion,
+                parse: svelte.parse,
+                version: svelte.VERSION,
                 filename: sourcePath,
                 isTsFile,
                 mode: 'ts',
@@ -439,7 +442,7 @@ export function writeOverlayTsconfig(
     const mergedExclude = Array.from(
         new Set([...(exclude ?? []), ...(virtualExclude ?? []), ...upsertedExcludes])
     );
-    const shimFiles = resolveSvelte2tsxShims().map((fileName) =>
+    const shimFiles = resolveSvelte2tsxShims(emitResult.workspacePath, cacheDir).map((fileName) =>
         toRelativePosix(overlayDir, fileName)
     );
     const rebasedReferences = parsed.raw?.references?.map((ref: any) => ({
@@ -1156,24 +1159,34 @@ export function updateDiagnosticsCache(
  * `svelte-html.d.ts` is preferred over `svelte-jsx-v4.d.ts` when available, so that
  * elements are typed from `svelte/elements` (including `<svelte:boundary>` and
  * user augmentations of `SvelteHTMLElements`).
+ * The shims are copied into the cache directory so that their `import('svelte')` statements
+ * resolve to the workspace's Svelte, not to the one next to svelte-check (e.g. a global install).
  *
  * @returns Array of absolute paths to the shim .d.ts files
  */
-function resolveSvelte2tsxShims(): string[] {
-    const isSvelte3 = Number(VERSION.split('.')[0]) < 4;
-    const svelteHtml = isSvelte3 ? undefined : resolveSvelteHtmlTypes();
+function resolveSvelte2tsxShims(workspacePath: string, cacheDir: string): string[] {
+    const sveltePkg = getPackageInfo('svelte', workspacePath);
+    const isSvelte3 = sveltePkg.version.major < 4;
+    const svelteHtml = isSvelte3 ? undefined : resolveSvelteHtmlTypes(sveltePkg.path);
     const shimNames = [isSvelte3 ? 'svelte-shims.d.ts' : 'svelte-shims-v4.d.ts'];
     if (!svelteHtml) {
         shimNames.push(isSvelte3 ? 'svelte-jsx.d.ts' : 'svelte-jsx-v4.d.ts');
     }
     // 'svelte-native-jsx.d.ts' // TODO read tsconfig/svelte.config.js to see if it's enabled
+    const shimsDir = path.join(cacheDir, SHIMS_SUBDIR);
+    fs.mkdirSync(shimsDir, { recursive: true });
     const resolved: string[] = [];
     for (const name of shimNames) {
+        let source: string;
         try {
-            resolved.push(require.resolve(`./${name}`));
+            source = require.resolve(`./${name}`);
         } catch {
             // ignore missing optional shims
+            continue;
         }
+        const target = path.join(shimsDir, name);
+        fs.copyFileSync(source, target);
+        resolved.push(target);
     }
     if (svelteHtml) {
         resolved.push(svelteHtml);
@@ -1181,12 +1194,7 @@ function resolveSvelte2tsxShims(): string[] {
     return resolved;
 }
 
-function resolveSvelteHtmlTypes(): string | undefined {
-    try {
-        const sveltePath = path.dirname(require.resolve('svelte/package.json'));
-        const svelteHtmlPath = path.join(sveltePath, 'svelte-html.d.ts');
-        return fs.existsSync(svelteHtmlPath) ? svelteHtmlPath : undefined;
-    } catch {
-        return undefined;
-    }
+function resolveSvelteHtmlTypes(sveltePath: string): string | undefined {
+    const svelteHtmlPath = path.join(sveltePath, 'svelte-html.d.ts');
+    return fs.existsSync(svelteHtmlPath) ? svelteHtmlPath : undefined;
 }
